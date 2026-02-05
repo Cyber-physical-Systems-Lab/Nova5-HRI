@@ -13,10 +13,13 @@
 #include <sys/select.h>
 #include <algorithm>
 
-// BCM pin numbers
-static constexpr unsigned PUMP_PIN = 20; // main solenoid valve
-static constexpr unsigned VENT_PIN = 21; // vent/bleed valve
-static const char* CHIP_NAME = "gpiochip0";
+// You used "BCM pin numbers" in v1. In libgpiod v2 we request by *line offsets* on a gpiochip.
+// On Raspberry Pi these often match BCM numbers on /dev/gpiochip0, but do not assume.
+// Verify with: gpioinfo /dev/gpiochip0  (or use gpiofind).
+static constexpr unsigned PUMP_OFFSET = 20; // main solenoid valve
+static constexpr unsigned VENT_OFFSET = 21; // vent/bleed valve
+static const char* CHIP_PATH = "/dev/gpiochip0";
+
 static const char* SERVER_IP = "192.168.0.37";
 static constexpr int SERVER_PORT = 8888;
 
@@ -27,65 +30,107 @@ enum class State { WAITING, DELIVERING };
 static volatile bool keep_running = true;
 void handle_sigint(int) { keep_running = false; }
 
-void set_valve(gpiod_line* line, ValveState state) {
-    int value = (state == ValveState::On) ? 1 : 0; // 1 asserts active-low
-    if (gpiod_line_set_value(line, value) < 0) std::perror("gpiod_line_set_value");
-}
+static inline void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+static inline void sleep_s (int s ) { std::this_thread::sleep_for(std::chrono::seconds(s)); }
 
-void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
-void sleep_s (int s ) { std::this_thread::sleep_for(std::chrono::seconds(s)); }
+// v2: you set values on a gpiod_line_request*, addressed by offset
+static inline void set_valve(gpiod_line_request* req, unsigned offset, ValveState state) {
+    const gpiod_line_value v =
+        (state == ValveState::On) ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE;
+
+    if (gpiod_line_request_set_value(req, offset, v) < 0) {
+        std::perror("gpiod_line_request_set_value");
+    }
+}
 
 int main() {
     std::signal(SIGINT, handle_sigint);
 
-    // Open chip and lines
-    gpiod_chip* chip = gpiod_chip_open_by_name(CHIP_NAME);
-    if (!chip) { std::perror("gpiod_chip_open_by_name"); return 1; }
+    // ---- libgpiod v2 setup ----
+    gpiod_chip* chip = gpiod_chip_open(CHIP_PATH);
+    if (!chip) { std::perror("gpiod_chip_open"); return 1; }
 
-    gpiod_line* pump = gpiod_chip_get_line(chip, PUMP_PIN);
-    gpiod_line* vent = gpiod_chip_get_line(chip, VENT_PIN);
-    if (!pump || !vent) {
-        std::cerr << "Failed to get lines " << PUMP_PIN << " or " << VENT_PIN << "\n";
+    gpiod_line_settings* settings = gpiod_line_settings_new();
+    if (!settings) { std::perror("gpiod_line_settings_new"); gpiod_chip_close(chip); return 1; }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+
+    // Match your v1 semantics: ACTIVE_LOW flag.
+    // With active-low set, "value=1" means "active" => physical LOW.
+    gpiod_line_settings_set_active_low(settings, true);
+
+    gpiod_line_config* lcfg = gpiod_line_config_new();
+    if (!lcfg) {
+        std::perror("gpiod_line_config_new");
+        gpiod_line_settings_free(settings);
         gpiod_chip_close(chip);
         return 1;
     }
 
-    // Request outputs with ACTIVE_LOW to match wiring
-    gpiod_line_request_config cfg = {};
-    cfg.request_type = GPIOD_LINE_REQUEST_DIRECTION_OUTPUT;
-    cfg.flags = GPIOD_LINE_REQUEST_FLAG_ACTIVE_LOW;
+    {
+        unsigned offs1 = PUMP_OFFSET;
+        unsigned offs2 = VENT_OFFSET;
+        if (gpiod_line_config_add_line_settings(lcfg, &offs1, 1, settings) < 0) {
+            std::perror("gpiod_line_config_add_line_settings(pump)");
+            gpiod_line_config_free(lcfg);
+            gpiod_line_settings_free(settings);
+            gpiod_chip_close(chip);
+            return 1;
+        }
+        if (gpiod_line_config_add_line_settings(lcfg, &offs2, 1, settings) < 0) {
+            std::perror("gpiod_line_config_add_line_settings(vent)");
+            gpiod_line_config_free(lcfg);
+            gpiod_line_settings_free(settings);
+            gpiod_chip_close(chip);
+            return 1;
+        }
+    }
 
-    cfg.consumer = "pump_kb_pump";
-    if (gpiod_line_request(pump, &cfg, 0) < 0) {
-        std::perror("gpiod_line_request(pump)");
+    gpiod_request_config* rcfg = gpiod_request_config_new();
+    if (!rcfg) {
+        std::perror("gpiod_request_config_new");
+        gpiod_line_config_free(lcfg);
+        gpiod_line_settings_free(settings);
         gpiod_chip_close(chip);
         return 1;
     }
-    cfg.consumer = "pump_kb_vent";
-    if (gpiod_line_request(vent, &cfg, 0) < 0) {
-        std::perror("gpiod_line_request(vent)");
-        gpiod_line_release(pump);
+    gpiod_request_config_set_consumer(rcfg, "pump_kb");
+
+    gpiod_line_request* req = gpiod_chip_request_lines(chip, rcfg, lcfg);
+    if (!req) {
+        std::perror("gpiod_chip_request_lines");
+        gpiod_request_config_free(rcfg);
+        gpiod_line_config_free(lcfg);
+        gpiod_line_settings_free(settings);
         gpiod_chip_close(chip);
         return 1;
     }
 
     // Start OFF: pump off, vent closed
-    set_valve(pump, ValveState::Off);
-    set_valve(vent, ValveState::Off);
+    set_valve(req, PUMP_OFFSET, ValveState::Off);
+    set_valve(req, VENT_OFFSET, ValveState::Off);
 
-    // Socket setup - connect to server
+    // ---- Socket setup - connect to server ----
     int sockfd;
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
-        std::perror("inet_pton"); return 1;
+        std::perror("inet_pton");
+        gpiod_line_request_release(req);
+        gpiod_request_config_free(rcfg);
+        gpiod_line_config_free(lcfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return 1;
     }
+
     std::cout << "Attempting to connect to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
     while (keep_running) {
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd < 0) { std::perror("socket"); return 1; }
+        if (sockfd < 0) { std::perror("socket"); break; }
+
         fcntl(sockfd, F_SETFL, O_NONBLOCK);
         int res = connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
         if (res == 0) {
@@ -107,27 +152,40 @@ int main() {
                 }
             }
         }
+
         std::cout << "Connect failed, retrying in 5 seconds\n";
         close(sockfd);
-        sleep(5);
+        sleep_s(5);
     }
+
     if (!keep_running) {
         std::cout << "Exiting due to signal during connection attempt.\n";
+        // safe shutdown of GPIO
+        set_valve(req, PUMP_OFFSET, ValveState::Off);
+        set_valve(req, VENT_OFFSET, ValveState::Off);
+        gpiod_line_request_release(req);
+        gpiod_request_config_free(rcfg);
+        gpiod_line_config_free(lcfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
         return 1;
     }
+
+    if (!keep_running) return 1;
+
     std::cout << "Waiting for commands: 'pickup reached' to turn pump ON, 'drop reached' to turn pump OFF\n";
 
     auto pump_on = [&]() {
-        set_valve(pump, ValveState::On); // energize main solenoid
+        set_valve(req, PUMP_OFFSET, ValveState::On); // energize main solenoid
         std::cout << "[STATE] Pump ON\n";
     };
 
     auto pump_off = [&]() {
-        set_valve(pump, ValveState::Off); // stop main solenoid
+        set_valve(req, PUMP_OFFSET, ValveState::Off); // stop main solenoid
         sleep_ms(50);
-        set_valve(vent, ValveState::On);  // open vent
+        set_valve(req, VENT_OFFSET, ValveState::On);  // open vent
         sleep_s(1);
-        set_valve(vent, ValveState::Off); // close vent
+        set_valve(req, VENT_OFFSET, ValveState::Off); // close vent
         sleep_ms(50);
         std::cout << "[STATE] Pump OFF (vented)\n";
     };
@@ -139,6 +197,43 @@ int main() {
     int send_counter = 0;
     std::cout << "Waiting for human input (press Enter to start delivering sticker)\n";
 
+    auto reconnect = [&]() -> bool {
+        while (keep_running) {
+            sockfd = socket(AF_INET, SOCK_STREAM, 0);
+            if (sockfd < 0) { std::perror("socket"); return false; }
+
+            fcntl(sockfd, F_SETFL, O_NONBLOCK);
+            int res = connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+            if (res == 0) {
+                std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
+                state = State::WAITING;
+                send_counter = 0;
+                return true;
+            } else if (errno == EINPROGRESS) {
+                fd_set writefds;
+                FD_ZERO(&writefds);
+                FD_SET(sockfd, &writefds);
+                struct timeval tv = {5, 0};
+                int retval = select(sockfd + 1, NULL, &writefds, NULL, &tv);
+                if (retval > 0) {
+                    int error;
+                    socklen_t len = sizeof(error);
+                    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
+                    if (error == 0) {
+                        std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
+                        state = State::WAITING;
+                        send_counter = 0;
+                        return true;
+                    }
+                }
+            }
+            std::cout << "Reconnect failed, retrying in 5 seconds\n";
+            close(sockfd);
+            sleep_s(5);
+        }
+        return false;
+    };
+
     while (keep_running) {
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -146,44 +241,13 @@ int main() {
         FD_SET(0, &readfds); // stdin
         struct timeval tv = {1, 0};
         int maxfd = std::max(sockfd, 0) + 1;
+
         int retval = select(maxfd, &readfds, NULL, NULL, &tv);
         if (retval == -1) {
             if (errno == EINTR) continue;
             std::perror("select, reconnecting");
             close(sockfd);
-            // Reconnect loop
-            while (keep_running) {
-                sockfd = socket(AF_INET, SOCK_STREAM, 0);
-                if (sockfd < 0) { std::perror("socket"); return 1; }
-                fcntl(sockfd, F_SETFL, O_NONBLOCK);
-                int res = connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-                if (res == 0) {
-                    std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
-                    state = State::WAITING;
-                    send_counter = 0;
-                    break;
-                } else if (errno == EINPROGRESS) {
-                    fd_set writefds;
-                    FD_ZERO(&writefds);
-                    FD_SET(sockfd, &writefds);
-                    struct timeval tv = {5, 0};
-                    int retval = select(sockfd + 1, NULL, &writefds, NULL, &tv);
-                    if (retval > 0) {
-                        int error;
-                        socklen_t len = sizeof(error);
-                        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
-                        if (error == 0) {
-                            std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
-                            state = State::WAITING;
-                            send_counter = 0;
-                            break;
-                        }
-                    }
-                }
-                std::cout << "Reconnect failed, retrying in 5 seconds\n";
-                close(sockfd);
-                sleep(5);
-            }
+            if (!reconnect()) break;
             continue;
         } else if (retval == 0) {
             // timeout
@@ -191,7 +255,7 @@ int main() {
                 send_counter++;
                 if (send_counter >= 10) {
                     const char* msg = "wait until next sticker\n";
-                    write(sockfd, msg, strlen(msg));
+                    (void)write(sockfd, msg, strlen(msg));
                     std::cout << "Sent: wait until next sticker\n";
                     send_counter = 0;
                 }
@@ -202,70 +266,33 @@ int main() {
                 read(0, &c, 1);
                 if (c == '\n' && state == State::WAITING) {
                     const char* msg = "deliver a new sticker\n";
-                    write(sockfd, msg, strlen(msg));
+                    (void)write(sockfd, msg, strlen(msg));
                     state = State::DELIVERING;
                     std::cout << "Started delivering sticker\n";
                 }
             }
+
             if (FD_ISSET(sockfd, &readfds)) {
                 char buffer[256];
                 memset(buffer, 0, sizeof(buffer));
                 int n = read(sockfd, buffer, sizeof(buffer) - 1);
+
                 if (n <= 0) {
-                    if (n == 0) {
-                        std::cout << "Server closed connection, reconnecting...\n";
-                    } else {
-                        std::perror("read, reconnecting");
-                    }
+                    if (n == 0) std::cout << "Server closed connection, reconnecting...\n";
+                    else std::perror("read, reconnecting");
                     close(sockfd);
-                    // Reconnect loop
-                    while (keep_running) {
-                        sockfd = socket(AF_INET, SOCK_STREAM, 0);
-                        if (sockfd < 0) { std::perror("socket"); return 1; }
-                        fcntl(sockfd, F_SETFL, O_NONBLOCK);
-                        int res = connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-                        if (res == 0) {
-                            std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
-                            state = State::WAITING;
-                            send_counter = 0;
-                            break;
-                        } else if (errno == EINPROGRESS) {
-                            fd_set writefds;
-                            FD_ZERO(&writefds);
-                            FD_SET(sockfd, &writefds);
-                            struct timeval tv = {5, 0};
-                            int retval = select(sockfd + 1, NULL, &writefds, NULL, &tv);
-                            if (retval > 0) {
-                                int error;
-                                socklen_t len = sizeof(error);
-                                getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
-                                if (error == 0) {
-                                    std::cout << "Reconnected to server at " << SERVER_IP << ":" << SERVER_PORT << "\n";
-                                    state = State::WAITING;
-                                    send_counter = 0;
-                                    break;
-                                }
-                            }
-                        }
-                        std::cout << "Reconnect failed, retrying in 5 seconds\n";
-                        close(sockfd);
-                        sleep(5);
-                    }
+                    if (!reconnect()) break;
                     continue;
                 }
+
                 std::string cmd(buffer);
                 std::cout << "Received: " << cmd << std::endl;
+
                 if (state == State::DELIVERING) {
                     if (cmd.find("pickup reached") != std::string::npos) {
-                        if (!is_on) {
-                            pump_on();
-                            is_on = true;
-                        }
+                        if (!is_on) { pump_on(); is_on = true; }
                     } else if (cmd.find("drop reached") != std::string::npos) {
-                        if (is_on) {
-                            pump_off();
-                            is_on = false;
-                        }
+                        if (is_on) { pump_off(); is_on = false; }
                     } else if (cmd.find("one sticker finished") != std::string::npos) {
                         state = State::WAITING;
                         std::cout << "Sticker finished, waiting for next\n";
@@ -283,14 +310,17 @@ int main() {
         pump_off();
         is_on = false;
     } else {
-        set_valve(pump, ValveState::Off);
-        set_valve(vent, ValveState::Off);
+        set_valve(req, PUMP_OFFSET, ValveState::Off);
+        set_valve(req, VENT_OFFSET, ValveState::Off);
     }
 
-    gpiod_line_release(vent);
-    gpiod_line_release(pump);
+    // ---- libgpiod v2 cleanup ----
+    gpiod_line_request_release(req);
+    gpiod_request_config_free(rcfg);
+    gpiod_line_config_free(lcfg);
+    gpiod_line_settings_free(settings);
     gpiod_chip_close(chip);
+
     std::cout << "Exited.\n";
     return 0;
 }
-
